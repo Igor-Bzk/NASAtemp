@@ -7,3 +7,5 @@ graphviz>=0.20.1
 streamlit
 matplotlib
 seaborn
+pyvis
+networkx
