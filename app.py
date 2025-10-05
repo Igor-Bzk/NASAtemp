@@ -2,12 +2,15 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import LabelEncoder
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
+from SREDT.utils import unpickle
+from tree_to_html import tree_to_html
+import ast
 
 # Prevent running this script directly with `python app.py` which leads to missing Streamlit context.
 try:
@@ -23,14 +26,6 @@ except Exception:
 st.set_page_config(page_title="CSV Classifier Explorer", layout="wide")
 
 st.title("CSV Classifier Explorer")
-from SREDT.utils import unpickle
-from tree_to_html import tree_to_html
-
-uploaded_file = st.file_uploader("Upload SREDT pkl file to visualize", type=["pkl"])
-if uploaded_file is not None:
-    clf = unpickle(uploaded_file)
-    tree_html = tree_to_html(clf, None, None)
-    st.components.v1.html(tree_html, height=600)
 
 st.sidebar.header("Upload and settings")
 
@@ -49,7 +44,7 @@ except Exception as e:
 
 # Simple column visibility control: multiselect that starts with all columns selected.
 all_columns = df.columns.tolist()
-visible_columns = st.multiselect("Select columns to show (deselect to hide)", options=all_columns, default=all_columns)
+visible_columns = st.multiselect("Select columns to show (deselect to hide)", key="visible_cols", options=all_columns, default=all_columns)
 
 if not visible_columns:
     st.warning("No columns selected — selecting all columns by default.")
@@ -66,20 +61,44 @@ with st.expander("Show full dataframe (visible columns)"):
     st.dataframe(df[visible_columns])
 
 # Sidebar: target selection
-st.sidebar.header("Modeling")
+st.sidebar.header("Preprocessing")
 target = st.sidebar.selectbox("Select target column (classification)", options=[None] + visible_columns)
+if target:
+    st.code(f"Labels: {df[target].value_counts().keys().tolist()}")
+    # Option to enter a list of allowed labels (label filtering)
+    st.sidebar.markdown("**Label filtering (optional)**")
+    label_filter_text = st.sidebar.text_area(
+        "Enter a Python list of allowed labels. Only rows with these labels will be kept.\nExample: ['A', 'B', 'C']",
+        value="['CONFIRMED', 'FALSE POSITIVE']", height=10
+    )
+
+    allowed_labels = None
+    if label_filter_text.strip():
+        try:
+            allowed_labels = ast.literal_eval(label_filter_text)
+            if not isinstance(allowed_labels, (list, tuple)):
+                st.sidebar.error("Label filter must be a list or tuple.")
+                allowed_labels = None
+        except Exception as e:
+            st.sidebar.error(f"Could not parse label filter: {e}")
+            allowed_labels = None
+
+        if allowed_labels:
+            # Filter rows to only those with allowed labels
+            df = df[df[target].isin(allowed_labels)]
+            st.sidebar.success("Applied label filtering.")
+
 
 if target is None:
     st.sidebar.info("Select a target column to enable modeling")
     st.stop()
 
-features = st.sidebar.multiselect("Select feature columns (empty = use all except target)", options=[c for c in visible_columns if c != target])
 # Allow entering a Python-style list of features (e.g. ['a','b']) or comma-separated list
 st.sidebar.markdown("**Feature list input (optional)**")
-height = st.sidebar.slider("Feature input height (lines)", min_value=3, max_value=20, value=4)
-feature_list_text = st.sidebar.text_area("Paste Python list or comma-separated names", value="", height=height)
+feature_list_text = st.sidebar.text_area("Paste Python list or comma-separated names", value='["koi_period","koi_impact","koi_duration","koi_depth","koi_num_transits","koi_count","koi_model_snr","koi_srad"]', height=10)
 
 # features multiselect already defined above using visible_columns when appropriate
+features = None
 
 if feature_list_text.strip():
     import ast
@@ -101,14 +120,16 @@ if feature_list_text.strip():
             features = valid
         else:
             st.sidebar.error("No valid feature names found in provided list; using multiselect/default.")
+        visible_columns = features + [target]
+        st.dataframe(df[visible_columns].head())
+        st.sidebar.success("Applied feature filtering.")
 
-if not features:
+
+if features is None:
     features = [c for c in visible_columns if c != target]
 
 # Preprocessing options
-st.sidebar.header("Preprocessing")
-encode_categoricals = st.sidebar.checkbox("One-hot encode categorical features (pd.get_dummies)", value=False)
-drop_na = st.sidebar.checkbox("Drop rows with NA in selected columns", value=True)
+st.sidebar.header("Modeling")
 
 st.write("## Selected features and target")
 st.write("Features:", features)
@@ -116,67 +137,33 @@ st.write("Target:", target)
 
 # Simple preprocessing
 data = df[features + [target]].copy()
-if drop_na:
-    data = data.dropna()
 
-# Encode target if categorical
-if data[target].dtype == object or data[target].dtype.name == 'category':
-    data[target] = data[target].astype('category').cat.codes
-
-# Optionally one-hot encode categorical features
-if encode_categoricals:
-    # only encode feature columns that are non-numeric
-    cat_feats = data[features].select_dtypes(include=['object', 'category']).columns.tolist()
-    if cat_feats:
-        data = pd.get_dummies(data, columns=cat_feats, drop_first=True)
-        # update feature list
-        features = [c for c in data.columns.tolist() if c != target]
+data = data.dropna()
 
 X = data[features]
 y = data[target]
 
-# Sidebar model selection
-model_name = st.sidebar.selectbox("Choose classifier", ["Random Forest", "Logistic Regression"]) 
+uploaded_file = st.sidebar.file_uploader("Upload and test model", type=["pkl"])
+if uploaded_file is not None:
+    clf = unpickle(uploaded_file)
+    label_encoder = LabelEncoder()
+    
+    y = label_encoder.fit_transform(y)
+    tree_html = tree_to_html(clf, features, label_encoder.classes_)
+    st.components.v1.html(tree_html, height=600)
+    preds = clf.predict(X)
+    acc = accuracy_score(y, preds)
 
-# Train/test split
-test_size = st.sidebar.slider("Test set proportion", 0.1, 0.5, 0.25)
-random_state = st.sidebar.number_input("Random seed", value=42, step=1)
+    st.write(f"### Test accuracy: {acc:.4f}")
+    st.write("#### Classification report")
+    st.text(classification_report(y, preds))
+
+    st.write("#### Confusion matrix")
+    fig, ax = plt.subplots()
+    sns.heatmap(confusion_matrix(y, preds), annot=True, fmt='d', ax=ax)
+    st.pyplot(fig)
+
+st.sidebar.write("or")
 
 if st.sidebar.button("Train model"):
-    try:
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=int(random_state))
-
-        # Simple scaling for logistic regression
-        scaler = None
-        if model_name == "Logistic Regression":
-            scaler = StandardScaler()
-            X_train = scaler.fit_transform(X_train)
-            X_test = scaler.transform(X_test)
-
-        if model_name == "Random Forest":
-            model = RandomForestClassifier(random_state=int(random_state))
-        else:
-            model = LogisticRegression(max_iter=1000, random_state=int(random_state))
-
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-
-        acc = accuracy_score(y_test, preds)
-        st.write(f"### Test accuracy: {acc:.4f}")
-        st.write("#### Classification report")
-        st.text(classification_report(y_test, preds))
-
-        st.write("#### Confusion matrix")
-        fig, ax = plt.subplots()
-        sns.heatmap(confusion_matrix(y_test, preds), annot=True, fmt='d', ax=ax)
-        st.pyplot(fig)
-
-        # Save model artifact for download
-        artifact = {
-            'model': model,
-            'scaler': scaler,
-            'features': features,
-            'target': target
-        }
-    except Exception as e:
-        st.error(f"Training failed: {e}")
+    pass
